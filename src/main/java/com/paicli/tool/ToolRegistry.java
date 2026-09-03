@@ -6,12 +6,14 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
 import java.io.BufferedReader;
-import java.io.File;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.*;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * 工具注册表 - 管理所有可用工具
@@ -39,7 +41,13 @@ public class ToolRegistry {
                 args -> {
                     String path = args.get("path");
                     try {
-                        String content = Files.readString(Path.of(path));
+                        Path target = SandboxGuard.resolve(path);
+                        if (!SandboxGuard.isInside(target)
+                                && !SandboxGuard.askUser("read_file:" + target,
+                                        "读取沙箱外的文件: " + target, false)) {
+                            return SandboxGuard.deniedMessage("读取沙箱外的文件: " + target);
+                        }
+                        String content = Files.readString(target);
                         return "文件内容:\n" + content;
                     } catch (Exception e) {
                         return "读取文件失败: " + e.getMessage();
@@ -59,13 +67,19 @@ public class ToolRegistry {
                     String path = args.get("path");
                     String content = args.get("content");
                     try {
+                        Path target = SandboxGuard.resolve(path);
+                        if (!SandboxGuard.isInside(target)
+                                && !SandboxGuard.askUser("write_file:" + target,
+                                        "写入沙箱外的文件: " + target, false)) {
+                            return SandboxGuard.deniedMessage("写入沙箱外的文件: " + target);
+                        }
                         // 确保父目录存在
-                        Path parent = Path.of(path).getParent();
+                        Path parent = target.getParent();
                         if (parent != null) {
                             Files.createDirectories(parent);
                         }
-                        Files.writeString(Path.of(path), content);
-                        return "文件已写入: " + path;
+                        Files.writeString(target, content);
+                        return "文件已写入: " + target;
                     } catch (Exception e) {
                         return "写入文件失败: " + e.getMessage();
                     }
@@ -80,16 +94,21 @@ public class ToolRegistry {
                 args -> {
                     String path = args.get("path");
                     try {
-                        File dir = new File(path);
-                        File[] files = dir.listFiles();
-                        if (files == null) {
-                            return "目录为空或不存在";
+                        Path target = SandboxGuard.resolve(path);
+                        if (!SandboxGuard.isInside(target)
+                                && !SandboxGuard.askUser("list_dir:" + target,
+                                        "列出沙箱外的目录: " + target, false)) {
+                            return SandboxGuard.deniedMessage("列出沙箱外的目录: " + target);
                         }
-                        StringBuilder sb = new StringBuilder("目录内容:\n");
-                        for (File f : files) {
-                            sb.append(f.isDirectory() ? "[D] " : "[F] ")
-                              .append(f.getName())
-                              .append("\n");
+                        if (!Files.isDirectory(target)) {
+                            return "目录不存在: " + target;
+                        }
+                        StringBuilder sb = new StringBuilder("目录内容 (" + target + "):\n");
+                        try (var stream = Files.list(target)) {
+                            stream.sorted().forEach(p -> sb
+                                    .append(Files.isDirectory(p) ? "[D] " : "[F] ")
+                                    .append(p.getFileName())
+                                    .append("\n"));
                         }
                         return sb.toString();
                     } catch (Exception e) {
@@ -101,6 +120,11 @@ public class ToolRegistry {
 
     /**
      * 注册Shell命令工具
+     *
+     * 防护策略:
+     * 1) 命令在沙箱根目录下执行 (pb.directory);
+     * 2) 命中只读白名单 -> 直接放行; 其余一律先征求用户同意;
+     * 3) 超时强杀 + 输出上限兜底, 防止死循环/刷屏拖垮 CLI。
      */
     private void registerShellTools() {
         tools.put("execute_command", new Tool(
@@ -110,21 +134,55 @@ public class ToolRegistry {
                 args -> {
                     String command = args.get("command");
                     try {
+                        // 白名单命令静默放行, 其余请求用户确认
+                        if (!SandboxGuard.isWhitelistedCommand(command)
+                                && !SandboxGuard.askUser("execute_command:" + command,
+                                        "执行命令: " + command, SandboxGuard.looksDangerous(command))) {
+                            return SandboxGuard.deniedMessage("执行命令: " + command);
+                        }
+
                         ProcessBuilder pb = new ProcessBuilder("bash", "-c", command);
+                        pb.directory(SandboxGuard.root().toFile());
                         pb.redirectErrorStream(true);
                         Process process = pb.start();
 
+                        // 独立线程持续读取输出, 避免管道写满导致死锁; 超上限即截断
                         StringBuilder output = new StringBuilder();
-                        try (BufferedReader reader = new BufferedReader(
-                                new InputStreamReader(process.getInputStream()))) {
-                            String line;
-                            while ((line = reader.readLine()) != null) {
-                                output.append(line).append("\n");
+                        AtomicBoolean truncated = new AtomicBoolean(false);
+                        Thread drain = new Thread(() -> {
+                            try (BufferedReader reader = new BufferedReader(
+                                    new InputStreamReader(process.getInputStream()))) {
+                                char[] buf = new char[4096];
+                                int n;
+                                long total = 0;
+                                while ((n = reader.read(buf)) != -1) {
+                                    total += n;
+                                    if (total > SandboxGuard.outputLimitBytes()) {
+                                        truncated.set(true);
+                                        break;
+                                    }
+                                    output.append(buf, 0, n);
+                                }
+                            } catch (IOException ignored) {
+                                // 进程被强杀时管道中断属预期
                             }
-                        }
+                        });
+                        drain.setDaemon(true);
+                        drain.start();
 
-                        int exitCode = process.waitFor();
-                        return String.format("命令执行完成 (exit code: %d)\n%s", exitCode, output);
+                        boolean finished = process.waitFor(SandboxGuard.timeoutSeconds(), TimeUnit.SECONDS);
+                        if (!finished) {
+                            process.destroyForcibly();
+                            process.waitFor();
+                        }
+                        drain.join(2000);
+                        int exitCode = process.exitValue();
+
+                        String head = finished ? "命令执行完成" : "命令执行超时, 已被强制终止";
+                        String tail = truncated.get()
+                                ? "\n[输出超过上限(" + SandboxGuard.outputLimitBytes() + " 字节), 已截断]"
+                                : "";
+                        return String.format("%s (exit code: %d)\n%s%s", head, exitCode, output, tail);
                     } catch (Exception e) {
                         return "执行命令失败: " + e.getMessage();
                     }

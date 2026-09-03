@@ -2,6 +2,7 @@ package com.paicli.cli;
 
 import com.paicli.agent.Agent;
 import com.paicli.agent.PlanExecuteAgent;
+import com.paicli.tool.SandboxGuard;
 
 import java.io.BufferedReader;
 import java.io.File;
@@ -29,6 +30,9 @@ public class Main {
         }
 
         System.out.println("✅ API Key 已加载\n");
+
+        // 打印沙箱保护配置(根目录/规则/可用环境变量)
+        SandboxGuard.printStartupInfo();
 
         Scanner scanner = new Scanner(System.in);
 
